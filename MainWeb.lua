@@ -1478,7 +1478,7 @@ local SettingsTab     = CreateTab("Settings")
 -- Code của tab nằm ở file riêng, nạp từ GitHub: Script.lua
 do
     local MODULE_FILE = "Script.lua"
-    local MODULE_URL  = "https://raw.githubusercontent.com/MinzTogether/Universal-Script/refs/heads/main/Script.lua"
+    local MODULE_URL  = "https://raw.githubusercontent.com/mowfzm/Script-Test/refs/heads/main/Script.lua"
     local ok, err = pcall(function()
         local src = game:HttpGet(MODULE_URL)
         local init = assert(loadstring(src, "=" .. MODULE_FILE))()
@@ -1527,7 +1527,7 @@ end
 -- Code của tab nằm ở file riêng, nạp từ GitHub: Status_Server.lua
 do
     local MODULE_FILE = "Status_Server.lua"
-    local MODULE_URL  = "https://raw.githubusercontent.com/MinzTogether/Universal-Script/refs/heads/main/Status_Server.lua"
+    local MODULE_URL  = "https://raw.githubusercontent.com/mowfzm/Script-Test/refs/heads/main/Status_Server.lua"
     local ok, err = pcall(function()
         local src = game:HttpGet(MODULE_URL)
         local init = assert(loadstring(src, "=" .. MODULE_FILE))()
@@ -1561,7 +1561,7 @@ end
 -- Code của tab nằm ở file riêng, nạp từ GitHub: Local.lua
 do
     local MODULE_FILE = "Local.lua"
-    local MODULE_URL  = "https://raw.githubusercontent.com/MinzTogether/Universal-Script/refs/heads/main/Local.lua"
+    local MODULE_URL  = "https://raw.githubusercontent.com/mowfzm/Script-Test/refs/heads/main/Local.lua"
     local ok, err = pcall(function()
         local src = game:HttpGet(MODULE_URL)
         local init = assert(loadstring(src, "=" .. MODULE_FILE))()
@@ -1593,7 +1593,7 @@ end
 -- Code của tab nằm ở file riêng, nạp từ GitHub: FPS.lua
 do
     local MODULE_FILE = "FPS.lua"
-    local MODULE_URL  = "https://raw.githubusercontent.com/MinzTogether/Universal-Script/refs/heads/main/FPS.lua"
+    local MODULE_URL  = "https://raw.githubusercontent.com/mowfzm/Script-Test/refs/heads/main/FPS.lua"
     local ok, err = pcall(function()
         local src = game:HttpGet(MODULE_URL)
         local init = assert(loadstring(src, "=" .. MODULE_FILE))()
