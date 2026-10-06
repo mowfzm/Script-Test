@@ -128,6 +128,13 @@ return function(ctx)
     end
 
     --// ================= SHARED UI =================
+    -- UIStroke on a text object outlines the TEXT by default (Contextual); these strokes are meant to be borders
+    local function borderStroke(inst, color, thickness)
+        local s = stroke(inst, color, thickness)
+        s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        return s
+    end
+
     -- Down arrow drawn from two bars rotated ±45° (rotate the holder: 0 = down, -90 = right)
     local function createChevron(parent, props, color, len, thick)
         props.BackgroundTransparency = 1
@@ -180,7 +187,7 @@ return function(ctx)
             AutoButtonColor = false,
         }, Root)
         corner(Header, 8)
-        stroke(Header)
+        borderStroke(Header)
 
         local Bar = new("Frame", {
             AnchorPoint = Vector2.new(0, 0.5),
@@ -1774,7 +1781,7 @@ return function(ctx)
         TextColor3 = Theme.Text,
     }, FPSTab)
     corner(ResetBtn, 8)
-    stroke(ResetBtn)
+    borderStroke(ResetBtn)
     pressScale(ResetBtn, 0.98)
     ResetBtn.MouseEnter:Connect(function()
         tween(ResetBtn, 0.15, { BackgroundColor3 = Theme.Header })

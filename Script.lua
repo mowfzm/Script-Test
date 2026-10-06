@@ -1,7 +1,11 @@
 --// ================= SCRIPT TAB (module) =================
--- This file is loaded by the main script (test.lua) and called with a ctx table
+-- This file is loaded by the main script (MainLocal.lua) and called with a ctx table
 -- containing the shared UI functions/variables. Returns ScriptDialog so the main file
 -- can use it when closing the UI (closeUI).
+--
+-- Library : save / edit / duplicate / pin / export / import / undo delete, search and sort (Added, A-Z, Edited, Recent)
+-- Running : Run / Stop, Output panel, Run clipboard, test run from the dialog, last run info on every script
+-- Startup : Auto-run per script (global pause in the menu); imported scripts must be reviewed before they run
 
 return function(ctx)
     local ScriptTab           = ctx.Tab
@@ -39,7 +43,6 @@ return function(ctx)
     local DeleteDialog        = ctx.DeleteDialog
 
     local CreateInfoRow       = ctx.CreateInfoRow
-    local CreateStyledButton  = ctx.CreateStyledButton
     local flashStrokeError    = ctx.flashStrokeError
     local bindBoxFocus        = ctx.bindBoxFocus
     local isLocked            = ctx.isLocked -- replaces the main file's uiLocked variable
@@ -56,6 +59,10 @@ return function(ctx)
     local MAX_IMPORT_BYTES    = 2000000
     local UNDO_SECONDS        = 6 -- 0 = delete immediately, no Undo
 
+    local STATE_FILE          = "L-scr.state.json" -- run info + auto-run switch (small, rewritten often)
+    local STARTUP_DELAY       = 1.5                -- seconds after load before auto-run starts
+    local REVIEW_SECONDS      = 5                  -- imported script: a second tap within this window runs it
+
     local SEARCH_MIN_ITEMS    = 5
     local SEARCH_H            = 30
     local PINNED_HEIGHT       = 36
@@ -64,7 +71,7 @@ return function(ctx)
     --// ---- Module state ----
     local ScriptList = {}                               -- array of v2 entries (plain data only, saved to file)
     local Rows       = {}                               -- [entry.id] = { Row, entry, nameLower, refresh }
-    local Running    = {}                               -- [entry.id] = { thread, startedAt, onState }
+    local Running    = {}                               -- [entry.id] = { thread, startedAt, onState, entry }
     local View       = { query = "", sort = "added" }
 
     -- forward declarations (assigned in the UI block below)
@@ -79,6 +86,27 @@ return function(ctx)
 
     local function shorten(text, n)
         return #text > n and (text:sub(1, n) .. "...") or text
+    end
+
+    -- UIStroke on a text object outlines the TEXT by default (Contextual); these strokes are meant to be borders
+    local function borderStroke(inst, color, thickness)
+        local s = stroke(inst, color, thickness)
+        s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        return s
+    end
+
+    local function firstLine(text)
+        return (tostring(text):match("^[^\r\n]*"))
+    end
+
+    -- "just now", "5m ago", "3h ago", "2d ago", then a date
+    local function ago(ts)
+        local d = os.time() - ts
+        if d < 45 then return "just now" end
+        if d < 3600 then return ("%dm ago"):format(math.max(1, math.floor(d / 60))) end
+        if d < 86400 then return ("%dh ago"):format(math.floor(d / 3600)) end
+        if d < 7 * 86400 then return ("%dd ago"):format(math.floor(d / 86400)) end
+        return os.date("%b %d", ts)
     end
 
     --// ---- Icons / icon buttons ----
@@ -135,6 +163,40 @@ return function(ctx)
             tween(Btn, 0.15, { BackgroundColor3 = Theme.Header })
         end)
         return Btn, Holder
+    end
+
+    -- Primary button (purple -> pink). A UIGradient tints everything its own object draws, text included,
+    -- so the caption is a child label. props: anchor, position, order, name
+    local function createAccentButton(parent, text, width, height, props)
+        props = props or {}
+        local Btn = new("TextButton", {
+            Name = props.name or "AccentButton",
+            AnchorPoint = props.anchor,
+            Position = props.position,
+            LayoutOrder = props.order or 0,
+            Size = UDim2.fromOffset(width, height),
+            BackgroundColor3 = WHITE,
+            BorderSizePixel = 0,
+            AutoButtonColor = false,
+            Text = "",
+        }, parent)
+        corner(Btn, 6)
+        new("UIGradient", { Color = ColorSequence.new(Theme.AccentPurple, Theme.AccentPink) }, Btn)
+        new("TextLabel", {
+            Name = "Caption",
+            Size = UDim2.fromScale(1, 1),
+            BackgroundTransparency = 1,
+            Text = text,
+            Font = Enum.Font.GothamBold,
+            TextSize = 13,
+            TextColor3 = WHITE,
+        }, Btn)
+        pressScale(Btn, 0.95)
+        Btn.MouseEnter:Connect(function()
+            if not isLocked() then tween(Btn, 0.15, { BackgroundTransparency = 0.15 }) end
+        end)
+        Btn.MouseLeave:Connect(function() tween(Btn, 0.15, { BackgroundTransparency = 0 }) end)
+        return Btn
     end
 
     --// ---- showToast: short notification, optionally with an action button ----
@@ -308,6 +370,8 @@ return function(ctx)
             createdAt = tonumber(base.createdAt) or now,
             updatedAt = tonumber(base.updatedAt) or now,
             favorite  = base.favorite == true,
+            auto      = (base.auto == true) or nil,                           -- run on startup
+            review    = (base.review == true or opts.review == true) or nil,  -- imported, not reviewed yet
         }, (name ~= wanted) and "renamed" or nil
     end
 
@@ -463,6 +527,72 @@ return function(ctx)
         end
     end
 
+    --// ---- Run info + auto-run switch: its own small file, so a run never rewrites the whole library ----
+    local State = { autoRun = true, stats = {} } -- stats[id] = { t = last run (os.time), n = runs, ok = last result }
+
+    local function loadState()
+        if not canFS then return end
+        local data = readJson(STATE_FILE)
+        if type(data) ~= "table" then return end
+        State.autoRun = data.autoRun ~= false
+        if type(data.stats) ~= "table" then return end
+        for id, s in pairs(data.stats) do
+            if type(id) == "string" and type(s) == "table" then
+                local ok
+                if type(s.ok) == "boolean" then ok = s.ok end
+                State.stats[id] = {
+                    t  = tonumber(s.t),
+                    n  = math.max(0, math.floor(tonumber(s.n) or 0)),
+                    ok = ok,
+                }
+            end
+        end
+    end
+
+    local stateQueued = false
+    local function saveState()
+        if not canFS or stateQueued then return end
+        stateQueued = true
+        task.delay(1, function() -- several runs in a row become one write
+            stateQueued = false
+            pcall(function()
+                writefile(STATE_FILE, HttpService:JSONEncode({ autoRun = State.autoRun, stats = State.stats }))
+            end)
+        end)
+    end
+
+    local function pruneState() -- forget run info of scripts that no longer exist
+        local alive, changed = {}, false
+        for _, e in ipairs(ScriptList) do alive[e.id] = true end
+        for id in pairs(State.stats) do
+            if not alive[id] then
+                State.stats[id] = nil
+                changed = true
+            end
+        end
+        if changed then saveState() end
+    end
+
+    local function touchRun(entry) -- a run starts (one-off runs have no info)
+        if entry.temp then return end
+        local s = State.stats[entry.id]
+        if not s then
+            s = { n = 0 }
+            State.stats[entry.id] = s
+        end
+        s.t, s.n = os.time(), s.n + 1
+        saveState()
+    end
+
+    local function finishRun(entry, ok) -- a run ended: true = no error
+        if entry.temp then return end
+        local s = State.stats[entry.id]
+        if s then
+            s.ok = ok
+            saveState()
+        end
+    end
+
     --// ---- compileScript: trial compile, does not run ----
     local compileCache = setmetatable({}, { __mode = "k" }) -- [entry] = { src, fn }
 
@@ -523,12 +653,16 @@ return function(ctx)
 
         local ok, fn, info = getCompiled(entry)
         if not ok then
-            logOut("error", entry.name, "Compile error - " .. describe(info))
-            onState("error")
+            local why = describe(info)
+            logOut("error", entry.name, "Compile error - " .. why)
+            touchRun(entry)
+            finishRun(entry, false)
+            onState("error", why)
             return false, "compile"
         end
 
-        local state = { startedAt = os.clock(), onState = onState }
+        touchRun(entry)
+        local state = { startedAt = os.clock(), onState = onState, entry = entry }
         Running[entry.id] = state
         onState("running")
         task.delay(0.4, function()
@@ -544,10 +678,12 @@ return function(ctx)
             if okRun then
                 logOut("ok", entry.name,
                     ("Finished in %.2fs"):format(os.clock() - state.startedAt))
+                finishRun(entry, true)
                 onState("ok")
             else
                 logOut("error", entry.name, "Runtime error - " .. tostring(err))
-                onState("error")
+                finishRun(entry, false)
+                onState("error", firstLine(err))
             end
         end)
         return true
@@ -561,6 +697,48 @@ return function(ctx)
         logOut("info", entry.name, "Stopped (main thread only)")
         state.onState("idle")
         return true
+    end
+
+    local function stopAll()
+        local entries = {}
+        for _, st in pairs(Running) do entries[#entries + 1] = st.entry end
+        for _, e in ipairs(entries) do stopScript(e) end
+        return #entries
+    end
+
+    -- One-off runs of code that is not in the library (test run from the dialog, clipboard)
+    local canClipboard = typeof(getclipboard) == "function"
+    local canRun = typeof(loadstring) == "function"
+
+    local quickSeq = 0
+    local function quickRun(name, code)
+        quickSeq = quickSeq + 1
+        local entry = { id = "quick-" .. quickSeq, name = name, script = code, temp = true }
+        return runScript(entry, function(state, detail)
+            if state == "ok" then
+                showToast("Ran OK", "success", { duration = 1.5 })
+            elseif state == "error" then
+                showToast(shorten(tostring(detail or "Script failed"), 120), "error")
+            end
+        end)
+    end
+
+    local function readClipboard()
+        if not canClipboard then return nil end
+        local ok, text = pcall(getclipboard)
+        if ok and type(text) == "string" and not text:match("^%s*$") then return text end
+        return nil
+    end
+
+    local function runClipboard()
+        local text = readClipboard()
+        if not text then
+            showToast("Clipboard is empty", "warn")
+        elseif #text > MAX_SCRIPT_LEN then
+            showToast("Clipboard text is too large", "error")
+        else
+            quickRun("Clipboard", text)
+        end
     end
 
     --// ---- Export / import library ----
@@ -633,7 +811,7 @@ return function(ctx)
         local added, skipped = {}, 0
         for _, item in ipairs(data.scripts) do
             local entry = #added < MAX_IMPORT_ITEMS and type(item) == "table"
-                and createEntry(item.name, item.script)
+                and createEntry(item.name, item.script, nil, { review = true })
             if entry then
                 ScriptList[#ScriptList + 1] = entry
                 added[#added + 1] = entry
@@ -785,6 +963,24 @@ return function(ctx)
         }
     end
 
+    -- A name for pasted code: its first comment line, else the file name of the first link in it
+    local function guessName(code)
+        local c = code:match("^%s*%-%-+[%s/#!]*([^\r\n]+)")
+        if c and not c:match("^%[=*%[") then
+            c = sanitizeName(c):sub(1, 40)
+            if #c >= 3 then return c end
+        end
+        local url = code:match("https?://[^%s\"'%)]+")
+        if url then
+            local file = url:gsub("[?#].*$", ""):match("([^/]+)/*$")
+            if file then
+                file = sanitizeName((file:gsub("%.%w+$", ""):gsub("%%20", " ")))
+                if #file >= 3 then return file end
+            end
+        end
+        return nil
+    end
+
     --// ---- NotBoxA: Add / Edit / Import ----
     local function createScriptDialog()
         local ACCENT = Theme.AccentPink
@@ -882,6 +1078,28 @@ return function(ctx)
 
         -- TextBoxA2: Script (two-way scrolling frame, no line wrapping to preserve indentation)
         fieldLabel("CodeLabel", "Script", 102)
+
+        -- small actions on the Script label row: Paste (from the clipboard) and Run (test run, nothing is saved)
+        local function miniAction(text, rightOffset)
+            local B = new("TextButton", {
+                Name = text .. "Btn",
+                AnchorPoint = Vector2.new(1, 0),
+                Position = UDim2.new(1, -rightOffset, 0, 100),
+                Size = UDim2.fromOffset(60, 20),
+                BackgroundTransparency = 1,
+                AutoButtonColor = false,
+                Text = text,
+                Font = Enum.Font.GothamBold,
+                TextSize = 12,
+                TextColor3 = ACCENT,
+                ZIndex = 53,
+            }, Box)
+            B.MouseEnter:Connect(function() tween(B, 0.12, { TextColor3 = Theme.Sakura }) end)
+            B.MouseLeave:Connect(function() tween(B, 0.12, { TextColor3 = ACCENT }) end)
+            return B
+        end
+        local PasteBtn = miniAction("Paste", 12)
+        local RunBtn   = miniAction("Run", 72)
         local CodeHolder = new("ScrollingFrame", {
             Position = UDim2.fromOffset(16, 122),
             Size = UDim2.new(1, -32, 1, -194), -- scales with the dialog height
@@ -1001,7 +1219,7 @@ return function(ctx)
         --// Dialog state
         local mode, current = "add", nil
         local baseline = { name = "", code = "" }
-        local hideToken, discardUntil = 0, 0
+        local hideToken, discardUntil, pasteUntil = 0, 0, 0
 
         local function fitSize()
             local vp = ScreenGui.AbsoluteSize
@@ -1021,6 +1239,9 @@ return function(ctx)
             local isImport = mode == "import"
             NameBox.Visible = not isImport
             if NameLabel then NameLabel.Visible = not isImport end
+            PasteBtn.Visible = canClipboard
+            RunBtn.Visible = canRun and not isImport
+            PasteBtn.Text, pasteUntil = "Paste", 0
             CodeBox.PlaceholderText = isImport and TEXT.importPlaceholder or TEXT.codePlaceholder
             if TitleLabel then
                 TitleLabel.Text = (mode == "edit" and TEXT.editTitle)
@@ -1073,11 +1294,46 @@ return function(ctx)
             if enterPressed then CodeBox:CaptureFocus() end
         end)
 
+        local function flashMini(btn, text, base)
+            btn.Text = text
+            task.delay(1.2, function()
+                if btn.Text == text then btn.Text = base end
+            end)
+        end
+
+        PasteBtn.MouseButton1Click:Connect(function()
+            local clip = readClipboard()
+            if not clip then
+                flashMini(PasteBtn, "Empty", "Paste")
+                return
+            end
+            if #clip > MAX_SCRIPT_LEN then
+                showToast("Clipboard text is too large", "error")
+                return
+            end
+            if CodeBox.Text ~= "" and os.clock() >= pasteUntil then
+                pasteUntil = os.clock() + 3 -- there is text already: a second tap replaces it
+                PasteBtn.Text = "Replace?"
+                task.delay(3, function()
+                    if os.clock() >= pasteUntil then PasteBtn.Text = "Paste" end
+                end)
+                return
+            end
+            pasteUntil = 0
+            CodeBox.Text = clip
+            CodeHolder.CanvasPosition = Vector2.new(0, 0)
+            if mode ~= "import" and NameBox.Text == "" then
+                local guess = guessName(clip)
+                if guess then NameBox.Text = guess end
+            end
+            flashMini(PasteBtn, "Pasted", "Paste")
+        end)
+
         return {
             Box = Box, show = show, hide = hide, isDirty = isDirty,
             getMode = function() return mode end,
             getEntry = function() return current end,
-            Save = Save, Cancel = Cancel,
+            Save = Save, Cancel = Cancel, PasteBtn = PasteBtn, RunBtn = RunBtn,
             NameBox = NameBox, NameStroke = NameStroke,
             CodeBox = CodeBox, CodeStroke = CodeStroke,
         }
@@ -1097,12 +1353,13 @@ return function(ctx)
             ScriptDialog.hide()
             return
         end
-        local before = { entry.name, entry.script, entry.updatedAt }
+        local before = { entry.name, entry.script, entry.updatedAt, entry.review }
         entry.name, entry.script, entry.updatedAt = name, code, os.time()
+        entry.review = nil -- opened and saved by the user, so it counts as reviewed
 
         local ok, err = saveLibrary()
         if not ok then
-            entry.name, entry.script, entry.updatedAt = before[1], before[2], before[3]
+            entry.name, entry.script, entry.updatedAt, entry.review = before[1], before[2], before[3], before[4]
             showToast("Save failed: " .. tostring(err), "error")
             return -- keep the dialog open so the text being typed isn't lost
         end
@@ -1132,6 +1389,30 @@ return function(ctx)
         ScriptDialog.hide()
         local msg = flag == "renamed" and ('Saved as "%s"'):format(entry.name) or "Script saved"
         showToast(msg, "success")
+    end
+
+    -- First-run helper: a tiny script that shows something visible in the game
+    local EXAMPLE_NAME = "Example: Hello"
+    local EXAMPLE_CODE = '-- Shows a notification in the game\n'
+        .. 'game:GetService("StarterGui"):SetCore("SendNotification", {\n'
+        .. '    Title = "Elysera",\n'
+        .. '    Text = "Hello from your first script!",\n'
+        .. '    Duration = 4,\n'
+        .. '})\n'
+
+    local function addExample()
+        local entry = createEntry(EXAMPLE_NAME, EXAMPLE_CODE)
+        if not entry then return end
+        ScriptList[#ScriptList + 1] = entry
+        local ok, err = saveLibrary()
+        if not ok then
+            table.remove(ScriptList) -- rollback
+            showToast("Save failed: " .. tostring(err), "error")
+            return
+        end
+        CreateScriptRow(entry)
+        applyListView()
+        showToast("Example added - tap play to try it", "success", { duration = 3 })
     end
 
     local function commitImport(text)
@@ -1245,6 +1526,25 @@ return function(ctx)
         return entry.favorite
     end
 
+    local function toggleAuto(entry)
+        entry.auto = (not entry.auto) or nil
+        local rec = Rows[entry.id]
+        if rec then rec.refresh() end
+        scheduleSave()
+        if entry.auto then
+            showToast(entry.review and "Runs on startup once you have reviewed it" or "Runs on startup",
+                "info", { duration = 2 })
+        else
+            showToast("Auto-run off", "info", { duration = 1.5 })
+        end
+    end
+
+    local function toggleGlobalAuto()
+        State.autoRun = not State.autoRun
+        saveState()
+        showToast(State.autoRun and "Auto-run is on" or "Auto-run is paused", "info", { duration = 1.8 })
+    end
+
     --// ---- Shared floating menu (row + header) ----
     local MenuCatcher
 
@@ -1322,6 +1622,8 @@ return function(ctx)
             { text = "Duplicate", run = function() duplicateScript(entry) end },
             { text = entry.favorite and "Unpin from top" or "Pin to top",
               run = function() toggleFavorite(entry) end },
+            { text = entry.auto and "Disable auto-run" or "Enable auto-run",
+              run = function() toggleAuto(entry) end },
             { text = "Export",    run = function() exportLibrary(entry) end },
             { text = "Delete", color = Theme.Danger, run = function()
                 askConfirm(('Do you want to delete "%s"?'):format(shorten(entry.name, 30)),
@@ -1331,10 +1633,17 @@ return function(ctx)
     end
 
     local function buildLibraryItems()
-        return {
-            { text = "Export all", run = function() exportLibrary() end },
-            { text = "Import",     run = function() ScriptDialog.show("import") end },
-        }
+        local items = {}
+        if canClipboard and canRun then
+            items[#items + 1] = { text = "Run clipboard", run = runClipboard }
+        end
+        items[#items + 1] = { text = "Export all", run = function() exportLibrary() end }
+        items[#items + 1] = { text = "Import",     run = function() ScriptDialog.show("import") end }
+        items[#items + 1] = { text = State.autoRun and "Auto-run: On" or "Auto-run: Off", run = toggleGlobalAuto }
+        if next(Running) then
+            items[#items + 1] = { text = "Stop all", color = Theme.Danger, run = stopAll }
+        end
+        return items
     end
 
     do
@@ -1367,11 +1676,15 @@ return function(ctx)
             TextColor3 = Theme.SubText,
         })
         local LibMoreBtn = CreateIconButton(Pinned, "more", 78, Theme.SubText)
-        local AddBtn = CreateStyledButton(Pinned, "+ Add", 70) -- ButtonA
+        local AddBtn = createAccentButton(Pinned, "+ Add", 70, 28, {
+            name = "AddButton", anchor = Vector2.new(1, 0.5), position = UDim2.new(1, 0, 0.5, 0),
+        }) -- ButtonA
 
         -- Search + sort bar (only shown when there are at least SEARCH_MIN_ITEMS scripts)
-        local SORT_MODES  = { "added", "name", "edited" }
-        local SORT_LABELS = { added = "Sort: Added", name = "Sort: A-Z", edited = "Sort: Edited" }
+        local SORT_MODES  = { "added", "name", "edited", "recent" }
+        local SORT_LABELS = {
+            added = "Sort: Added", name = "Sort: A-Z", edited = "Sort: Edited", recent = "Sort: Recent",
+        }
 
         SearchRow = new("Frame", {
             Name = "SearchRow",
@@ -1453,6 +1766,57 @@ return function(ctx)
             Visible = false,
         }, ListPanel)
 
+        -- First-run card, shown while the library is empty
+        local EmptyCard = new("Frame", {
+            Name = "EmptyCard",
+            LayoutOrder = -2,
+            Size = UDim2.new(1, 0, 0, 0),
+            AutomaticSize = Enum.AutomaticSize.Y,
+            BackgroundColor3 = Theme.Panel,
+            BorderSizePixel = 0,
+            Visible = false,
+        }, ListPanel)
+        corner(EmptyCard, 8)
+        stroke(EmptyCard)
+        padding(EmptyCard, 16, 16, 16, 16)
+        list(EmptyCard, 8, { HorizontalAlignment = Enum.HorizontalAlignment.Center })
+
+        label(EmptyCard, {
+            LayoutOrder = 1, Size = UDim2.new(1, 0, 0, 32), Text = "{ }", TextSize = 28,
+            TextColor3 = Theme.Sakura, TextXAlignment = Enum.TextXAlignment.Center,
+        })
+        label(EmptyCard, {
+            LayoutOrder = 2, Size = UDim2.new(1, 0, 0, 20), Text = "No scripts yet", TextSize = 16,
+            TextColor3 = Theme.Text, TextXAlignment = Enum.TextXAlignment.Center,
+        })
+        label(EmptyCard, {
+            LayoutOrder = 3, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+            Font = Enum.Font.Gotham, TextSize = 12, TextWrapped = true, TextColor3 = Theme.SubText,
+            TextXAlignment = Enum.TextXAlignment.Center,
+            Text = "Paste a script, give it a name and tap Save. Run it any time with the play button.",
+        })
+        local EmptyActions = new("Frame", {
+            LayoutOrder = 4, Size = UDim2.new(1, 0, 0, 34), BackgroundTransparency = 1,
+        }, EmptyCard)
+        list(EmptyActions, 10, {
+            FillDirection = Enum.FillDirection.Horizontal,
+            HorizontalAlignment = Enum.HorizontalAlignment.Center,
+        })
+        local EmptyAdd = createAccentButton(EmptyActions, "+ Add script", 104, 34, { name = "EmptyAdd", order = 1 })
+        local EmptyImport = new("TextButton", {
+            Name = "EmptyImport", LayoutOrder = 2, Size = UDim2.fromOffset(76, 34),
+            BackgroundColor3 = Theme.Header, BorderSizePixel = 0, AutoButtonColor = false,
+            Text = "Import", Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = Theme.Text,
+        }, EmptyActions)
+        corner(EmptyImport, 6)
+        borderStroke(EmptyImport)
+        pressScale(EmptyImport, 0.95)
+        local ExampleLink = new("TextButton", {
+            Name = "ExampleLink", LayoutOrder = 5, Size = UDim2.new(1, 0, 0, 22),
+            BackgroundTransparency = 1, AutoButtonColor = false,
+            Text = "or add an example", Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = Theme.AccentPink,
+        }, EmptyCard)
+
         -- List frame height = what remains of FunctionScroll after subtracting the blocks above/below -> the Script tab doesn't scroll on the outside
         fitListPanel = function()
             local used = CONTENT_EDGE * 2 + PINNED_HEIGHT + TAB_LIST_GAP + 2
@@ -1475,6 +1839,14 @@ return function(ctx)
                     if a.updatedAt ~= b.updatedAt then return a.updatedAt > b.updatedAt end
                     return a.id < b.id
                 end)
+            elseif View.sort == "recent" then -- last run first, never-run scripts keep the "edited" order
+                table.sort(arr, function(a, b)
+                    local x = State.stats[a.id] and State.stats[a.id].t or 0
+                    local y = State.stats[b.id] and State.stats[b.id].t or 0
+                    if x ~= y then return x > y end
+                    if a.updatedAt ~= b.updatedAt then return a.updatedAt > b.updatedAt end
+                    return a.id < b.id
+                end)
             end
             return arr
         end
@@ -1492,10 +1864,9 @@ return function(ctx)
                 end
             end
 
-            EmptyLabel.Visible = shown == 0
-            EmptyLabel.Text = #ScriptList == 0
-                and 'No scripts yet. Tap "+ Add" to create one.'
-                or ('No scripts match "%s"'):format(View.query)
+            EmptyCard.Visible = #ScriptList == 0
+            EmptyLabel.Visible = shown == 0 and #ScriptList > 0
+            EmptyLabel.Text = ('No scripts match "%s"'):format(View.query)
 
             local showSearch = #ScriptList >= SEARCH_MIN_ITEMS
             if SearchRow.Visible ~= showSearch then
@@ -1534,17 +1905,46 @@ return function(ctx)
             local Row, Left = CreateInfoRow(ListPanel, entry.name)
             Row.Name = "Script_" .. entry.id
 
-            Left.Size = UDim2.new(1, -76, 1, 0)
+            -- two lines: the name, and below it what happened the last time it ran
+            local rowLayout = Left:FindFirstChildOfClass("UIListLayout")
+            if rowLayout then rowLayout:Destroy() end
             local Title = Left:FindFirstChild("Title")
             Title.AutomaticSize = Enum.AutomaticSize.None
-            Title.Size = UDim2.new(1, 0, 1, 0)
+            Title.Position = UDim2.fromOffset(0, 6)
+            Title.Size = UDim2.new(1, 0, 0, 22)
             Title.TextTruncate = Enum.TextTruncate.AtEnd
             local baseColor = Title.TextColor3
 
+            local Dot = new("Frame", {
+                Position = UDim2.fromOffset(0, 33),
+                Size = UDim2.fromOffset(6, 6),
+                BackgroundColor3 = Theme.Border,
+                BorderSizePixel = 0,
+            }, Left)
+            corner(Dot, 3)
+            local Sub = label(Left, {
+                Name = "Sub",
+                Position = UDim2.fromOffset(12, 28),
+                Size = UDim2.new(1, -12, 0, 16),
+                Font = Enum.Font.Gotham,
+                Text = "",
+                TextSize = 11,
+                TextColor3 = Theme.SubText,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                TextTruncate = Enum.TextTruncate.AtEnd,
+            })
+
             -- indicator bar for pinned scripts
+            -- CreateInfoRow (MainLocal.lua) gives every row padding(Frame, 14, 12), and a UIPadding shifts
+            -- every child's Position inward. At x = 3 the bar therefore landed at x = 17, on top of the
+            -- title and the status dot. Subtract the padding (read at runtime, so it keeps working if that
+            -- value ever changes) to put the bar on the row's real left edge. ClipsDescendants clips to the
+            -- frame itself, not the padded area, so the bar is still fully visible there.
+            local rowPad = Row:FindFirstChildOfClass("UIPadding")
+            local padLeft = rowPad and rowPad.PaddingLeft.Offset or 0
             local FavBar = new("Frame", {
                 AnchorPoint = Vector2.new(0, 0.5),
-                Position = UDim2.new(0, 3, 0.5, 0),
+                Position = UDim2.new(0, 3 - padLeft, 0.5, 0),
                 Size = UDim2.new(0, 3, 0.6, 0),
                 BackgroundColor3 = Theme.AccentPink,
                 BorderSizePixel = 0,
@@ -1552,17 +1952,61 @@ return function(ctx)
             }, Row)
             corner(FavBar, 2)
 
+            -- AUTO pill (gradient on the pill, caption in a child label)
+            local AutoPill = new("Frame", {
+                Name = "AutoPill",
+                AnchorPoint = Vector2.new(1, 0.5),
+                Position = UDim2.new(1, -70, 0.5, 0),
+                Size = UDim2.fromOffset(40, 18),
+                BackgroundColor3 = WHITE,
+                BorderSizePixel = 0,
+                Visible = false,
+            }, Row)
+            corner(AutoPill, 9)
+            new("UIGradient", { Color = ColorSequence.new(Theme.AccentPurple, Theme.AccentPink) }, AutoPill)
+            new("TextLabel", {
+                Size = UDim2.fromScale(1, 1),
+                BackgroundTransparency = 1,
+                Text = "AUTO",
+                Font = Enum.Font.GothamBold,
+                TextSize = 10,
+                TextColor3 = WHITE,
+            }, AutoPill)
+
             local PLAY_COLOR = Theme.AccentPink
             local ExecBtn, ExecIcon = CreateIconButton(Row, "play", 0, PLAY_COLOR)
             local MoreBtn = CreateIconButton(Row, "more", 34, Theme.SubText)
 
             local rec = { Row = Row, entry = entry }
             Rows[entry.id] = rec
+
+            local function paintInfo()
+                local st = State.stats[entry.id]
+                local text, color, dot = "Never run", Theme.SubText, Theme.Border
+                if Running[entry.id] then
+                    text, color, dot = "Running...", Theme.Sakura, Theme.AccentPink
+                elseif entry.review then
+                    text, color, dot = "Imported - review before running", Theme.AccentPurple, Theme.AccentPurple
+                elseif st and st.t then
+                    local runs = (st.n and st.n > 1) and (" - " .. st.n .. " runs") or ""
+                    if st.ok == false then
+                        text, color, dot = "Failed " .. ago(st.t) .. runs, Theme.Danger, Theme.Danger
+                    else
+                        text, dot = "Ran " .. ago(st.t) .. runs, Theme.Sakura
+                    end
+                end
+                Sub.Text, Sub.TextColor3, Dot.BackgroundColor3 = text, color, dot
+            end
+            rec.paintInfo = paintInfo
+
             function rec.refresh()
                 Title.Text = entry.name
                 Title.TextColor3 = entry.favorite and Theme.Sakura or baseColor
                 FavBar.Visible = entry.favorite
+                AutoPill.Visible = entry.auto == true
+                Left.Size = UDim2.new(1, -(76 + (entry.auto and 46 or 0)), 1, 0)
                 rec.nameLower = entry.name:lower()
+                paintInfo()
             end
             rec.refresh()
 
@@ -1584,6 +2028,7 @@ return function(ctx)
 
             local function setRunVisual(state)
                 if not ExecIcon.Parent then return end
+                paintInfo()
                 if state == "running" then return end
                 if state == "running_long" then
                     showStopIcon(Theme.Danger)
@@ -1598,10 +2043,31 @@ return function(ctx)
                 end
             end
 
+            -- Imported scripts need a deliberate second tap (or an edit) before their first run
+            local armedUntil = 0
+            function rec.start()
+                if entry.review then
+                    if os.clock() >= armedUntil then
+                        armedUntil = os.clock() + REVIEW_SECONDS
+                        showToast("Imported script - read it first. Tap play again to run it.", "warn", {
+                            duration = REVIEW_SECONDS,
+                            actionText = "Review",
+                            onAction = function() openEditDialog(entry) end,
+                        })
+                        return false, "review"
+                    end
+                    entry.review = nil -- tapped twice: the user accepted it
+                    armedUntil = 0
+                    scheduleSave()
+                    rec.refresh()
+                end
+                return runScript(entry, setRunVisual)
+            end
+
             ExecBtn.MouseButton1Click:Connect(function()
                 if isLocked() then return end
                 if Running[entry.id] then stopScript(entry); return end
-                runScript(entry, setRunVisual)
+                rec.start()
             end)
 
             MoreBtn.MouseButton1Click:Connect(function()
@@ -1620,6 +2086,8 @@ return function(ctx)
         end)
 
         local report = loadLibrary()
+        loadState()
+        pruneState()
         for _, entry in ipairs(ScriptList) do CreateScriptRow(entry) end
         applyListView()
         announceLoad(report)
@@ -1663,6 +2131,59 @@ return function(ctx)
                 commitAdd(name, code)
             end
         end)
+
+        -- Dialog: Run = test run of what is typed (nothing is saved)
+        ScriptDialog.RunBtn.MouseButton1Click:Connect(function()
+            local code = ScriptDialog.CodeBox.Text
+            if code:match("^%s*$") then
+                flashStrokeError(ScriptDialog.CodeStroke)
+                return
+            end
+            local name = sanitizeName(ScriptDialog.NameBox.Text)
+            local ok, why = quickRun(name ~= "" and name or "Test run", code)
+            if not ok and why == "compile" then flashStrokeError(ScriptDialog.CodeStroke) end
+        end)
+
+        -- First-run card buttons
+        EmptyAdd.MouseButton1Click:Connect(function()
+            if not isLocked() then ScriptDialog.show("add") end
+        end)
+        EmptyImport.MouseButton1Click:Connect(function()
+            if not isLocked() then ScriptDialog.show("import") end
+        end)
+        ExampleLink.MouseButton1Click:Connect(function()
+            if not isLocked() then addExample() end
+        end)
+
+        -- Keep "5m ago" and the Recent order fresh whenever the tab comes back on screen
+        ScriptTab:GetPropertyChangedSignal("Visible"):Connect(function()
+            if not ScriptTab.Visible then return end
+            for _, rec in pairs(Rows) do rec.paintInfo() end
+            applyListView()
+        end)
+
+        -- Auto-run: start the scripts marked "Enable auto-run" shortly after the UI has loaded
+        if State.autoRun then
+            local queue = {}
+            for _, e in ipairs(ScriptList) do
+                if e.auto and not e.review then queue[#queue + 1] = e end
+            end
+            if #queue > 0 then
+                task.delay(STARTUP_DELAY, function()
+                    if not ScreenGui.Parent or not State.autoRun then return end
+                    showToast(("Auto-running %d script%s"):format(#queue, #queue == 1 and "" or "s"),
+                        "info", { duration = 2 })
+                    for _, e in ipairs(queue) do
+                        local rec = Rows[e.id]
+                        if rec and e.auto and not e.review and not Running[e.id] then
+                            logOut("info", e.name, "Auto-run on startup")
+                            rec.start()
+                            task.wait(0.25)
+                        end
+                    end
+                end)
+            end
+        end
     end
 
     return ScriptDialog

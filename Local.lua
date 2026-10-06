@@ -709,6 +709,14 @@ return function(ctx)
     end
 
     --// ---------- Small shared helpers ----------
+    -- UIStroke on a TextButton/TextBox/TextLabel outlines the TEXT by default (Contextual mode);
+    -- these strokes are meant to draw the border, so the mode is set explicitly.
+    function Core.BorderStroke(inst, color, thickness)
+        local s = stroke(inst, color, thickness)
+        s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        return s
+    end
+
     function Core.Tween(inst, time, props)
         TweenService:Create(inst, TweenInfo.new(time, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
     end
@@ -777,7 +785,7 @@ return function(ctx)
             BackgroundColor3 = restBg,
             BorderSizePixel = 0,
             AutoButtonColor = false,
-            Text = text,
+            Text = accent and "" or text,
             RichText = true,
             Font = Enum.Font.GothamBold,
             TextSize = opts.textSize or 13,
@@ -786,11 +794,25 @@ return function(ctx)
         }, parent)
         corner(Btn, opts.radius or 6)
 
+        -- Accent buttons: a UIGradient tints everything its own object draws (text included), so the
+        -- caption is a child label. Default buttons draw their text themselves.
         local BtnStroke
+        local Caption = Btn
         if accent then
             new("UIGradient", { Color = ColorSequence.new(Theme.AccentPurple, Theme.AccentPink) }, Btn)
+            Caption = new("TextLabel", {
+                Name = "Caption",
+                Size = UDim2.fromScale(1, 1),
+                BackgroundTransparency = 1,
+                Text = text,
+                RichText = true,
+                Font = Enum.Font.GothamBold,
+                TextSize = opts.textSize or 13,
+                TextColor3 = restText,
+                TextTruncate = Enum.TextTruncate.AtEnd,
+            }, Btn)
         else
-            BtnStroke = stroke(Btn)
+            BtnStroke = Core.BorderStroke(Btn)
         end
         local Scale = new("UIScale", { Scale = 1 }, Btn)
 
@@ -835,13 +857,13 @@ return function(ctx)
         function api.setText(t)
             baseText = t
             flashToken += 1                              -- a pending flash must not overwrite the new text
-            Btn.Text = t
-            Btn.TextColor3 = textColor
+            Caption.Text = t
+            Caption.TextColor3 = textColor
         end
 
         function api.setEnabled(on)
             enabled = on and true or false
-            Btn.TextTransparency = enabled and 0 or 0.5
+            Caption.TextTransparency = enabled and 0 or 0.5
             if BtnStroke then BtnStroke.Transparency = enabled and 0 or 0.5 end
             paint()
         end
@@ -850,7 +872,7 @@ return function(ctx)
         function api.setActive(on)
             if accent then return end
             textColor = on and Theme.Sakura or Theme.Text
-            Btn.TextColor3 = textColor
+            Caption.TextColor3 = textColor
             BtnStroke.Color = on and Theme.AccentPink or Theme.Border
         end
 
@@ -858,12 +880,12 @@ return function(ctx)
         function api.flash(t, seconds, isError)
             flashToken += 1
             local my = flashToken
-            Btn.Text = t
-            if not accent then Btn.TextColor3 = isError and Theme.Danger or Theme.Sakura end
+            Caption.Text = t
+            if not accent then Caption.TextColor3 = isError and Theme.Danger or Theme.Sakura end
             task.delay(seconds or 1.2, function()
                 if my == flashToken and Btn.Parent then
-                    Btn.Text = baseText
-                    Btn.TextColor3 = textColor
+                    Caption.Text = baseText
+                    Caption.TextColor3 = textColor
                 end
             end)
         end
@@ -928,7 +950,7 @@ return function(ctx)
             AutoButtonColor = false,
         }, Root)
         corner(Header, 8)
-        stroke(Header)
+        Core.BorderStroke(Header)
 
         -- Accent bar on the left: pink while something in this section is on
         local Bar = new("Frame", {
@@ -1059,7 +1081,7 @@ return function(ctx)
             ClipsDescendants = true,
         }, parent)
         corner(Box, 6)
-        local BoxStroke = stroke(Box)
+        local BoxStroke = Core.BorderStroke(Box)
         padding(Box, 10, 10)
         bindBoxFocus(Box, BoxStroke)
         return Box, BoxStroke
